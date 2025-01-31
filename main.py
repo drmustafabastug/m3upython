@@ -100,20 +100,25 @@ async def health_check():
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10)
 )
-async def fetch_url(client: httpx.AsyncClient, url: str, headers: Dict) -> httpx.Response:
-    try:
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
-        return response
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
-        raise
-    except httpx.RequestError as e:
-        logger.error(f"Request error occurred: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error during fetch: {str(e)}")
-        raise
+async def fetch_url(url: str, headers: Dict) -> str:
+    async with httpx.AsyncClient(
+        verify=False,
+        timeout=httpx.Timeout(60.0, connect=20.0),
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10)
+    ) as client:
+        try:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            return response.text
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
+            raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except httpx.RequestError as e:
+            logger.error(f"Request error occurred: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error during fetch: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/channels")
 async def get_channels(url: str, request: Request):
@@ -127,72 +132,36 @@ async def get_channels(url: str, request: Request):
         decoded_url = urllib.parse.unquote(url)
         logger.debug(f"Decoded URL: {decoded_url}")
         
-        timeout = httpx.Timeout(60.0, connect=20.0)
-        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        }
         
-        async with httpx.AsyncClient(
-            verify=False,
-            timeout=timeout,
-            limits=limits
-        ) as client:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Connection': 'keep-alive',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
-            }
-            
-            logger.info("Sending request to target server...")
-            try:
-                response = await fetch_url(client, decoded_url, headers)
-                logger.info(f"Target server response status: {response.status_code}")
-                logger.debug(f"Response headers: {dict(response.headers)}")
+        logger.info("Sending request to target server...")
+        content = await fetch_url(decoded_url, headers)
+        
+        logger.info(f"Received content length: {len(content)}")
+        if len(content) > 0:
+            logger.debug(f"Content preview: {content[:200]}")
+        
+        channels = await parse_m3u(content)
+        logger.info(f"Successfully parsed {len(channels)} channels")
+        
+        result = {
+            "total": len(channels),
+            "channels": [channel.to_dict() for channel in channels]
+        }
+        
+        return JSONResponse(content=result)
                 
-                content = response.text
-                logger.info(f"Received content length: {len(content)}")
-                if len(content) > 0:
-                    logger.debug(f"Content preview: {content[:200]}")
-                
-                channels = await parse_m3u(content)
-                logger.info(f"Successfully parsed {len(channels)} channels")
-                
-                result = {
-                    "total": len(channels),
-                    "channels": [channel.to_dict() for channel in channels]
-                }
-                
-                return JSONResponse(content=result)
-                
-            except httpx.HTTPStatusError as e:
-                return JSONResponse(
-                    status_code=e.response.status_code,
-                    content={"error": f"HTTP error: {str(e)}"}
-                )
-            except httpx.RequestError as e:
-                return JSONResponse(
-                    status_code=500,
-                    content={"error": f"Request error: {str(e)}"}
-                )
-            except asyncio.TimeoutError:
-                return JSONResponse(
-                    status_code=504,
-                    content={"error": "Request timed out"}
-                )
-            except Exception as e:
-                logger.error(f"Error processing request: {str(e)}")
-                logger.error(traceback.format_exc())
-                return JSONResponse(
-                    status_code=500,
-                    content={"error": f"Error processing request: {str(e)}"}
-                )
-                
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = f"Unexpected error: {str(e)}"
         logger.error(error_msg)
         logger.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"error": error_msg}
-        )
+        raise HTTPException(status_code=500, detail=error_msg)
