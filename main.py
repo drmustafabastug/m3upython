@@ -5,14 +5,20 @@ import httpx
 import urllib.parse
 import re
 import logging
+import traceback
+import sys
 
-# Logging ayarları
-logging.basicConfig(level=logging.INFO)
+# Detaylı loglama ayarları
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS ayarları - daha geniş
+# CORS ayarları
 origins = [
     "http://localhost",
     "http://localhost:8000",
@@ -24,7 +30,7 @@ origins = [
     "exp://localhost:19001",
     "exp://localhost:19002",
     "exp://localhost:19006",
-    "*"  # Geliştirme aşamasında tüm originlere izin ver
+    "*"
 ]
 
 app.add_middleware(
@@ -38,13 +44,16 @@ app.add_middleware(
 
 async def is_m3u_content(content: str) -> bool:
     if not content:
+        logger.warning("Empty content received")
         return False
     
-    return (
-        '#EXTINF' in content or 
-        '#EXTM3U' in content or 
-        bool(re.search(r'^https?://', content, re.MULTILINE))
-    )
+    has_extinf = '#EXTINF' in content
+    has_extm3u = '#EXTM3U' in content
+    has_urls = bool(re.search(r'^https?://', content, re.MULTILINE))
+    
+    logger.debug(f"Content validation: EXTINF={has_extinf}, EXTM3U={has_extm3u}, URLs={has_urls}")
+    
+    return has_extinf or has_extm3u or has_urls
 
 @app.get("/", response_class=PlainTextResponse)
 async def health_check():
@@ -52,28 +61,37 @@ async def health_check():
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Global error: {str(exc)}")
+    error_details = {
+        'error': str(exc),
+        'type': type(exc).__name__,
+        'traceback': traceback.format_exc()
+    }
+    logger.error(f"Global error: {error_details}")
     return JSONResponse(
         status_code=500,
-        content={"error": str(exc)}
+        content=error_details
     )
 
 @app.get("/proxy")
 async def proxy(url: str, request: Request):
     if not url:
+        logger.error("Missing URL parameter")
         raise HTTPException(status_code=400, detail="URL parameter is required")
     
     logger.info(f"Incoming request from: {request.client.host}")
     logger.info(f"Fetching URL: {url}")
     
     try:
-        # URL decode
         decoded_url = urllib.parse.unquote(url)
+        logger.debug(f"Decoded URL: {decoded_url}")
         
-        # httpx client with SSL verification disabled and timeout
+        timeout = httpx.Timeout(30.0, connect=10.0)
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        
         async with httpx.AsyncClient(
-            verify=False, 
-            timeout=30.0,
+            verify=False,
+            timeout=timeout,
+            limits=limits,
             follow_redirects=True
         ) as client:
             headers = {
@@ -84,10 +102,17 @@ async def proxy(url: str, request: Request):
             }
             
             logger.info("Sending request to target server...")
-            response = await client.get(decoded_url, headers=headers)
-            logger.info(f"Target server response status: {response.status_code}")
+            try:
+                response = await client.get(decoded_url, headers=headers)
+                logger.info(f"Target server response status: {response.status_code}")
+                logger.debug(f"Response headers: {dict(response.headers)}")
+            except httpx.RequestError as e:
+                logger.error(f"Request failed: {str(e)}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Request failed: {str(e)}"}
+                )
             
-            # Status code kontrolü
             if response.status_code != 200:
                 logger.error(f"Target server error: {response.status_code}")
                 return JSONResponse(
@@ -95,10 +120,18 @@ async def proxy(url: str, request: Request):
                     content={"error": f"Target server returned {response.status_code}"}
                 )
             
-            content = response.text
-            logger.info(f"Received content length: {len(content)}")
+            try:
+                content = response.text
+                logger.info(f"Received content length: {len(content)}")
+                if len(content) > 0:
+                    logger.debug(f"Content preview: {content[:200]}")
+            except Exception as e:
+                logger.error(f"Failed to decode content: {str(e)}")
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Failed to decode content: {str(e)}"}
+                )
             
-            # M3U içerik kontrolü
             if not await is_m3u_content(content):
                 logger.error("Invalid M3U content")
                 return JSONResponse(
@@ -106,7 +139,6 @@ async def proxy(url: str, request: Request):
                     content={"error": "Invalid M3U format"}
                 )
             
-            # Response headers
             response_headers = {
                 'Access-Control-Allow-Origin': '*',
                 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -115,20 +147,24 @@ async def proxy(url: str, request: Request):
                 'Content-Type': 'text/plain; charset=utf-8'
             }
             
+            logger.info("Sending successful response")
             return PlainTextResponse(
                 content=content,
                 headers=response_headers
             )
             
     except httpx.RequestError as e:
-        logger.error(f"Request error: {str(e)}")
+        error_msg = f"Request error: {str(e)}"
+        logger.error(error_msg)
         return JSONResponse(
             status_code=500,
-            content={"error": f"Request error: {str(e)}"}
+            content={"error": error_msg}
         )
     except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
+        error_msg = f"Unexpected error: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
         return JSONResponse(
             status_code=500,
-            content={"error": str(e)}
+            content={"error": error_msg}
         )
