@@ -10,8 +10,8 @@ import sys
 from typing import List, Dict, Optional
 import json
 import asyncio
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Logging ayarları
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -21,7 +21,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CORS ayarları
 origins = ["*"]
 
 app.add_middleware(
@@ -52,45 +51,69 @@ async def parse_m3u(content: str) -> List[Channel]:
     channels = []
     current_channel = None
     
-    for line in content.splitlines():
-        line = line.strip()
-        
-        if not line:
-            continue
+    try:
+        for line in content.splitlines():
+            line = line.strip()
             
-        if line.startswith('#EXTINF:'):
-            current_channel = Channel()
-            
-            # Parse title
-            title_match = re.search(r'tvg-name="([^"]*)"', line)
-            if title_match:
-                current_channel.title = title_match.group(1)
-            else:
-                # If no tvg-name, try to get title from the end of the line
-                title = line.split(',')[-1].strip()
-                current_channel.title = title
-            
-            # Parse logo
-            logo_match = re.search(r'tvg-logo="([^"]*)"', line)
-            if logo_match:
-                current_channel.logo = logo_match.group(1)
-            
-            # Parse group
-            group_match = re.search(r'group-title="([^"]*)"', line)
-            if group_match:
-                current_channel.group = group_match.group(1)
+            if not line:
+                continue
                 
-        elif line.startswith('http://') or line.startswith('https://'):
-            if current_channel:
-                current_channel.url = line
-                channels.append(current_channel)
-                current_channel = None
+            if line.startswith('#EXTINF:'):
+                current_channel = Channel()
+                
+                # Parse title
+                title_match = re.search(r'tvg-name="([^"]*)"', line)
+                if title_match:
+                    current_channel.title = title_match.group(1)
+                else:
+                    # If no tvg-name, try to get title from the end of the line
+                    title = line.split(',')[-1].strip()
+                    current_channel.title = title
+                
+                # Parse logo
+                logo_match = re.search(r'tvg-logo="([^"]*)"', line)
+                if logo_match:
+                    current_channel.logo = logo_match.group(1)
+                
+                # Parse group
+                group_match = re.search(r'group-title="([^"]*)"', line)
+                if group_match:
+                    current_channel.group = group_match.group(1)
+                    
+            elif line.startswith('http://') or line.startswith('https://'):
+                if current_channel:
+                    current_channel.url = line
+                    channels.append(current_channel)
+                    current_channel = None
+    except Exception as e:
+        logger.error(f"Error parsing M3U content: {str(e)}")
+        logger.error(f"Problematic line: {line}")
+        raise
     
     return channels
 
 @app.get("/")
 async def health_check():
     return {"status": "OK"}
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10)
+)
+async def fetch_url(client: httpx.AsyncClient, url: str, headers: Dict) -> httpx.Response:
+    try:
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        return response
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
+        raise
+    except httpx.RequestError as e:
+        logger.error(f"Request error occurred: {str(e)}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during fetch: {str(e)}")
+        raise
 
 @app.get("/channels")
 async def get_channels(url: str, request: Request):
@@ -124,67 +147,48 @@ async def get_channels(url: str, request: Request):
             
             logger.info("Sending request to target server...")
             try:
-                response = await client.get(decoded_url, headers=headers)
+                response = await fetch_url(client, decoded_url, headers)
                 logger.info(f"Target server response status: {response.status_code}")
                 logger.debug(f"Response headers: {dict(response.headers)}")
-            except httpx.RequestError as e:
-                logger.error(f"Request failed: {str(e)}")
-                return JSONResponse(
-                    status_code=500,
-                    content={"error": f"Request failed: {str(e)}"}
-                )
-            except asyncio.TimeoutError:
-                logger.error("Request timed out")
-                return JSONResponse(
-                    status_code=504,
-                    content={"error": "Request timed out"}
-                )
-            
-            if response.status_code != 200:
-                logger.error(f"Target server error: {response.status_code}")
-                return JSONResponse(
-                    status_code=response.status_code,
-                    content={"error": f"Target server returned {response.status_code}"}
-                )
-            
-            try:
+                
                 content = response.text
                 logger.info(f"Received content length: {len(content)}")
                 if len(content) > 0:
                     logger.debug(f"Content preview: {content[:200]}")
-            except Exception as e:
-                logger.error(f"Failed to decode content: {str(e)}")
-                return JSONResponse(
-                    status_code=500,
-                    content={"error": f"Failed to decode content: {str(e)}"}
-                )
-            
-            try:
+                
                 channels = await parse_m3u(content)
                 logger.info(f"Successfully parsed {len(channels)} channels")
-            except Exception as e:
-                logger.error(f"Failed to parse M3U content: {str(e)}")
+                
+                result = {
+                    "total": len(channels),
+                    "channels": [channel.to_dict() for channel in channels]
+                }
+                
+                return JSONResponse(content=result)
+                
+            except httpx.HTTPStatusError as e:
+                return JSONResponse(
+                    status_code=e.response.status_code,
+                    content={"error": f"HTTP error: {str(e)}"}
+                )
+            except httpx.RequestError as e:
                 return JSONResponse(
                     status_code=500,
-                    content={"error": f"Failed to parse M3U content: {str(e)}"}
+                    content={"error": f"Request error: {str(e)}"}
                 )
-            
-            # Convert to JSON
-            result = {
-                "total": len(channels),
-                "channels": [channel.to_dict() for channel in channels]
-            }
-            
-            return JSONResponse(content=result)
-            
-    except httpx.RequestError as e:
-        error_msg = f"Request error: {str(e)}"
-        logger.error(error_msg)
-        logger.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"error": error_msg}
-        )
+            except asyncio.TimeoutError:
+                return JSONResponse(
+                    status_code=504,
+                    content={"error": "Request timed out"}
+                )
+            except Exception as e:
+                logger.error(f"Error processing request: {str(e)}")
+                logger.error(traceback.format_exc())
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"Error processing request: {str(e)}"}
+                )
+                
     except Exception as e:
         error_msg = f"Unexpected error: {str(e)}"
         logger.error(error_msg)
